@@ -564,8 +564,15 @@ namespace NuGet.Test.Utility
 
             foreach (var pair in properties)
             {
-                var subItem = new XElement(XName.Get(pair.Key, ns.NamespaceName), pair.Value);
-                entry.Add(subItem);
+                if (pair.Key.Equals("version", StringComparison.OrdinalIgnoreCase))
+                {
+                    entry.Add(new XAttribute(XName.Get("Version"), pair.Value));
+                }
+                else
+                {
+                    var subItem = new XElement(XName.Get(pair.Key, ns.NamespaceName), pair.Value);
+                    entry.Add(subItem);
+                }
             }
 
             var lastItemGroup = doc.Root.Elements().Where(e => e.Name.LocalName == "ItemGroup").Last();
