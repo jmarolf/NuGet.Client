@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.ComponentModel.Composition;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.VisualStudio;
@@ -36,7 +37,7 @@ namespace NuGet.SolutionRestoreManager
 
         private EnvDTE.SolutionEvents _solutionEvents;
         private CancellationTokenSource _workerCts;
-        private Lazy<Task> _backgroundJobRunner;
+        private AsyncLazy<bool> _backgroundJobRunner;
         private Lazy<BlockingCollection<SolutionRestoreRequest>> _pendingRequests;
         private BackgroundRestoreOperation _pendingRestore;
         private Task<bool> _activeRestoreTask;
@@ -46,6 +47,8 @@ namespace NuGet.SolutionRestoreManager
 
         private readonly JoinableTaskCollection _joinableCollection;
         private readonly JoinableTaskFactory _joinableFactory;
+
+        private IVsSolutionManager SolutionManager => _solutionManager.Value;
 
         private ErrorListProvider ErrorListProvider => NuGetUIThreadHelper.JoinableTaskFactory.Run(_errorListProvider.GetValueAsync);
 
@@ -160,11 +163,13 @@ namespace NuGet.SolutionRestoreManager
                     async () =>
                     {
                         using (_joinableCollection.Join())
+                        // Do not block VS forever
+                        // After the specified delay the task will disjoin.
+                        using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60)))
                         {
-                            // Do not block VS forever
-                            await Task.WhenAny(_backgroundJobRunner.Value, Task.Delay(TimeSpan.FromSeconds(60)));
+                            await _backgroundJobRunner.GetValueAsync(cts.Token);
                         }
-                    }, 
+                    },
                     JoinableTaskCreationOptions.LongRunning);
             }
 
@@ -180,15 +185,14 @@ namespace NuGet.SolutionRestoreManager
             {
                 _workerCts = new CancellationTokenSource();
 
-                _backgroundJobRunner = new Lazy<Task>(
-                    valueFactory: () => Task.Run(
-                        function: () => StartBackgroundJobRunnerAsync(_workerCts.Token),
-                        cancellationToken: _workerCts.Token));
+                _backgroundJobRunner = new AsyncLazy<bool>(
+                    () => StartBackgroundJobRunnerAsync(_workerCts.Token),
+                    _joinableFactory);
 
                 _pendingRequests = new Lazy<BlockingCollection<SolutionRestoreRequest>>(
                     () => new BlockingCollection<SolutionRestoreRequest>(RequestQueueLimit));
 
-                _pendingRestore = new BackgroundRestoreOperation();
+                _pendingRestore = new BackgroundRestoreOperation(SolutionRestoreRequest.OnUpdate());
                 _activeRestoreTask = Task.FromResult(true);
                 _restoreJobContext = new SolutionRestoreJobContext();
             }
@@ -217,12 +221,7 @@ namespace NuGet.SolutionRestoreManager
             // Initialize if not already done.
             await InitializeAsync();
 
-            if (_solutionManager.Value.IsSolutionFullyLoaded)
-            {
-                // start background runner if not yet started
-                // ignore the value
-                var ignore = _backgroundJobRunner.Value;
-            }
+            EnsureBackgroundRunner();
 
             var pendingRestore = _pendingRestore;
 
@@ -241,6 +240,28 @@ namespace NuGet.SolutionRestoreManager
             }
         }
 
+        private void EnsureBackgroundRunner()
+        {
+            _joinableFactory.Run(async () =>
+            {
+                if (SolutionManager.IsSolutionFullyLoaded
+                    && !_backgroundJobRunner.IsValueCreated)
+                {
+                    // start background runner if it was not started yet
+                    using (var cts = new CancellationTokenSource(100))
+                    {
+                        try
+                        {
+                            await _backgroundJobRunner.GetValueAsync(cts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                        }
+                    }
+                }
+            });
+        }
+
         public bool Restore(SolutionRestoreRequest request)
         {
             return _joinableFactory.Run(
@@ -251,7 +272,18 @@ namespace NuGet.SolutionRestoreManager
                         // Initialize if not already done.
                         await InitializeAsync();
 
-                        using (var restoreOperation = new BackgroundRestoreOperation())
+                        if (request.RestoreSource == RestoreOperationSource.OnBuild
+                            && !await SolutionManager.SolutionHasDeferredProjectsAsync())
+                        {
+                            if (SolutionManager.GetNuGetProjects().All(p => p is CpsPackageReferenceProject))
+                            {
+                                // Do nothing if all projects are .NET Core projects (Roslyn project system)
+                                // in that case on-build restore is not needed
+                                return true;
+                            }
+                        }
+
+                        using (var restoreOperation = new BackgroundRestoreOperation(request))
                         {
                             await PromoteTaskToActiveAsync(restoreOperation, _workerCts.Token);
 
@@ -269,7 +301,7 @@ namespace NuGet.SolutionRestoreManager
             Interlocked.Exchange(ref _restoreJobContext, new SolutionRestoreJobContext());
         }
 
-        private async Task StartBackgroundJobRunnerAsync(CancellationToken token)
+        private async Task<bool> StartBackgroundJobRunnerAsync(CancellationToken token)
         {
             // Hops onto a background pool thread
             await TaskScheduler.Default;
@@ -310,7 +342,9 @@ namespace NuGet.SolutionRestoreManager
                         // Replaces pending restore operation with a new one.
                         // Older value is ignored.
                         var ignore = Interlocked.CompareExchange(
-                            ref _pendingRestore, new BackgroundRestoreOperation(), restoreOperation);
+                            ref _pendingRestore,
+                            new BackgroundRestoreOperation(SolutionRestoreRequest.OnUpdate()),
+                            restoreOperation);
 
                         token.ThrowIfCancellationRequested();
 
@@ -331,6 +365,8 @@ namespace NuGet.SolutionRestoreManager
                     }
                 }
             }
+
+            return true;
         }
 
         private async Task<bool> ProcessRestoreRequestAsync(
@@ -350,34 +386,52 @@ namespace NuGet.SolutionRestoreManager
             return await joinableTask;
         }
 
-        private async Task PromoteTaskToActiveAsync(BackgroundRestoreOperation restoreOperation, CancellationToken token)
+        private async Task PromoteTaskToActiveAsync(
+            BackgroundRestoreOperation restoreOperation,
+            CancellationToken token)
         {
-            var pendingTask = restoreOperation.Task;
+            RestoreOperationProgressUI progressUI = null;
 
-            int attempt = 0;
-            for (var retry = true;
-                retry && !token.IsCancellationRequested && attempt != PromoteAttemptsLimit;
-                attempt++)
+            if (restoreOperation.RestoreRequest.RestoreSource == RestoreOperationSource.OnBuild
+                && !_activeRestoreTask.IsCompleted)
             {
-                // Grab local copy of active task
-                var activeTask = _activeRestoreTask;
-
-                // Await for the completion of the active *unbound* task
-                var cancelTcs = new TaskCompletionSource<bool>();
-                using (var ctr = token.Register(() => cancelTcs.TrySetCanceled()))
-                {
-                    await Task.WhenAny(activeTask, cancelTcs.Task);
-                }
-
-                // Try replacing active task with the new one.
-                // Retry from the beginning if the active task has changed.
-                retry = Interlocked.CompareExchange(
-                    ref _activeRestoreTask, pendingTask, activeTask) != activeTask;
+                progressUI = await WaitDialogProgress.StartAsync(_serviceProvider, _joinableFactory, token);
             }
 
-            if (attempt == PromoteAttemptsLimit)
+            try
             {
-                throw new InvalidOperationException("Failed promoting pending task.");
+                var pendingTask = restoreOperation.Task;
+
+                int attempt = 0;
+                for (var retry = true;
+                    retry && !token.IsCancellationRequested && attempt != PromoteAttemptsLimit;
+                    attempt++)
+                {
+                    // Grab local copy of active task
+                    var activeTask = _activeRestoreTask;
+
+                    // Await for the completion of the active *unbound* task
+                    var cancelTcs = new TaskCompletionSource<bool>();
+                    using (var ctr = token.Register(() => cancelTcs.TrySetCanceled()))
+                    {
+                        await Task.WhenAny(activeTask).WithCancellation(token);
+                    }
+
+                    // Try replacing active task with the new one.
+                    // Retry from the beginning if the active task has changed.
+                    retry = Interlocked.CompareExchange(
+                        ref _activeRestoreTask, pendingTask, activeTask) != activeTask;
+                }
+
+                if (attempt == PromoteAttemptsLimit)
+                {
+                    throw new InvalidOperationException("Failed promoting pending task.");
+                }
+            }
+            catch (Exception)
+            {
+                progressUI?.Dispose();
+                throw;
             }
         }
 
@@ -407,9 +461,7 @@ namespace NuGet.SolutionRestoreManager
         {
             if (_pendingRequests.IsValueCreated)
             {
-                // ensure background runner has started
-                // ignore the value
-                var ignore = _backgroundJobRunner.Value;
+                EnsureBackgroundRunner();
             }
 
             return VSConstants.S_OK;
@@ -422,9 +474,21 @@ namespace NuGet.SolutionRestoreManager
 
             private TaskCompletionSource<bool> JobTcs { get; } = new TaskCompletionSource<bool>();
 
+            public SolutionRestoreRequest RestoreRequest { get; } = SolutionRestoreRequest.OnUpdate();
+
             public Task<bool> Task => JobTcs.Task;
 
             public System.Runtime.CompilerServices.TaskAwaiter<bool> GetAwaiter() => Task.GetAwaiter();
+
+            public BackgroundRestoreOperation(SolutionRestoreRequest restoreRequest)
+            {
+                if (restoreRequest == null)
+                {
+                    throw new ArgumentNullException(nameof(restoreRequest));
+                }
+
+                RestoreRequest = restoreRequest;
+            }
 
             public void ContinuationAction(Task<bool> targetTask)
             {
